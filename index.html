@@ -727,6 +727,7 @@ const FIREBASE_CONFIG = {
 let _firestore = null;
 let _cloudReady = false;
 let _syncDebounceTimer = null;
+let _lastPushTimestamp = 0; // Track when we last pushed to cloud (for listener loop fix)
 const DEVICE_ID = 'dev_' + (localStorage.getItem('sat_device_id') || (() => { const id = Math.random().toString(36).substr(2, 8); localStorage.setItem('sat_device_id', id); return id; })());
 
 async function initFirebase() {
@@ -839,6 +840,7 @@ async function pushToCloud(profileName, payload) {
       }
     }
 
+    _lastPushTimestamp = Date.now();
     console.log('[Cloud] Pushed data for', profileName,
       '(sessions:', (payload.sessions || []).length,
       ', configs:', (payload.testConfigs || []).length,
@@ -931,12 +933,21 @@ async function mergeCloudIntoLocal(profileName, cloudData) {
       for (const [word, stats] of Object.entries(cloudData.vocabState.wordStats)) {
         if (!merged.wordStats[word]) merged.wordStats[word] = stats;
         else {
+          const local = merged.wordStats[word];
           merged.wordStats[word] = {
-            unfamiliar: merged.wordStats[word].unfamiliar || stats.unfamiliar,
-            timesShown: Math.max(merged.wordStats[word].timesShown || 0, stats.timesShown || 0),
-            timesCorrect: Math.max(merged.wordStats[word].timesCorrect || 0, stats.timesCorrect || 0),
-            timesWrong: Math.max(merged.wordStats[word].timesWrong || 0, stats.timesWrong || 0),
-            lastSeen: Math.max(merged.wordStats[word].lastSeen || 0, stats.lastSeen || 0)
+            unfamiliar: local.unfamiliar || stats.unfamiliar,
+            timesShown: Math.max(local.timesShown || 0, stats.timesShown || 0),
+            timesCorrect: Math.max(local.timesCorrect || 0, stats.timesCorrect || 0),
+            timesWrong: Math.max(local.timesWrong || 0, stats.timesWrong || 0),
+            lastSeen: Math.max(local.lastSeen || 0, stats.lastSeen || 0),
+            // Mastery fields — keep the more advanced state
+            masteryLevel: Math.max(local.masteryLevel || 0, stats.masteryLevel || 0),
+            consecutiveKnowIt: Math.max(local.consecutiveKnowIt || 0, stats.consecutiveKnowIt || 0),
+            lastReviewDate: Math.max(local.lastReviewDate || 0, stats.lastReviewDate || 0),
+            nextReviewDate: Math.min(local.nextReviewDate || Infinity, stats.nextReviewDate || Infinity) === Infinity ? 0 : Math.min(local.nextReviewDate || Infinity, stats.nextReviewDate || Infinity),
+            interval: Math.max(local.interval || 0, stats.interval || 0),
+            sessionStreak: Math.max(local.sessionStreak || 0, stats.sessionStreak || 0),
+            lastStreakSession: Math.max(local.lastStreakSession || 0, stats.lastStreakSession || 0)
           };
         }
       }
@@ -959,10 +970,21 @@ function listenToCloud(profileName, onUpdate) {
   if (!profileRef) return () => {};
 
   // Debounce: aggregate changes from multiple listeners before calling onUpdate
+  // Fix: skip listener triggers within 3s of our own push to prevent loop
   let _listenerTimer = null;
-  function triggerUpdate() {
+  function triggerUpdate(source) {
+    // Skip if we just pushed — subcollection listeners fire on local writes too
+    if (Date.now() - _lastPushTimestamp < 3000) {
+      console.log('[Cloud] Skipping listener trigger from', source, '— within 3s of our own push');
+      return;
+    }
     if (_listenerTimer) clearTimeout(_listenerTimer);
     _listenerTimer = setTimeout(async () => {
+      // Re-check after debounce delay too
+      if (Date.now() - _lastPushTimestamp < 3000) {
+        console.log('[Cloud] Skipping debounced update — within 3s of our own push');
+        return;
+      }
       try {
         const fullData = await pullFromCloud(profileName);
         if (fullData && fullData.updatedBy !== DEVICE_ID) {
@@ -978,20 +1000,20 @@ function listenToCloud(profileName, onUpdate) {
     (doc) => {
       if (!doc.exists) return;
       if (doc.data().updatedBy === DEVICE_ID) return;
-      triggerUpdate();
+      triggerUpdate('profile-doc');
     },
     (err) => console.warn('[Cloud] Profile listener error:', err.message)
   );
 
   // Listen to sessions subcollection
   const unsub2 = profileRef.collection('sessions').onSnapshot(
-    () => triggerUpdate(),
+    () => triggerUpdate('sessions'),
     (err) => console.warn('[Cloud] Sessions listener error:', err.message)
   );
 
   // Listen to configs subcollection
   const unsub3 = profileRef.collection('configs').onSnapshot(
-    () => triggerUpdate(),
+    () => triggerUpdate('configs'),
     (err) => console.warn('[Cloud] Configs listener error:', err.message)
   );
 
@@ -3213,8 +3235,53 @@ function generateVocabQuestions(count, vocabState, filterWords) {
 }
 
 // ==================== VOCAB PAGE COMPONENT ====================
+// ── Mastery level constants for Learn Words flashcards ──
+const MASTERY_LEVELS = [
+  { level: 0, label: 'New', icon: '\uD83D\uDD34', color: 'var(--red)' },       // red circle
+  { level: 1, label: 'Learning', icon: '\uD83D\uDFE1', color: 'var(--orange)' }, // yellow circle
+  { level: 2, label: 'Familiar', icon: '\uD83D\uDFE2', color: 'var(--green)' },  // green circle
+  { level: 3, label: 'Mastered', icon: '\u2B50', color: '#ffd700' }              // star
+];
+const SPACED_INTERVALS = [1, 3, 7, 14]; // days between reviews for "Know it"
+
+function getWordMastery(wordStats, word) {
+  const s = wordStats[word];
+  if (!s || !s.masteryLevel) return MASTERY_LEVELS[0];
+  return MASTERY_LEVELS[Math.min(s.masteryLevel, 3)];
+}
+
+function buildFlashcardDeck(vocabState, count) {
+  const now = Date.now();
+  const today = new Date().setHours(0, 0, 0, 0);
+  const ws = vocabState.wordStats || {};
+
+  // Score each word for priority: lower = pick first
+  const scored = VOCAB_BANK.map(v => {
+    const s = ws[v.word] || {};
+    const mastery = s.masteryLevel || 0;
+    const nextReview = s.nextReviewDate || 0;
+    const isDue = nextReview > 0 && nextReview <= now;
+    const isNew = mastery === 0 && !s.lastReviewDate;
+    const isUnfamiliar = s.unfamiliar;
+    const isLearning = mastery <= 1 && s.lastReviewDate;
+
+    let priority = 1000;
+    if (isUnfamiliar && isNew) priority = 0;          // Unfamiliar + never reviewed
+    else if (isUnfamiliar) priority = 50;              // Unfamiliar + has been reviewed
+    else if (isLearning) priority = 100 - mastery;     // Still learning
+    else if (isDue) priority = 200;                     // Due for spaced review
+    else if (isNew) priority = 300 + Math.random()*50;  // New words, shuffled
+    else priority = 500 + (nextReview - now) / 86400000; // Not yet due — push back
+
+    return { vocab: v, priority, mastery };
+  });
+
+  scored.sort((a, b) => a.priority - b.priority);
+  return scored.slice(0, count).map(s => s.vocab);
+}
+
 function VocabPage({ showToast, profileName }) {
-  const [phase, setPhase] = useState('main'); // main | selecting | confirmed | summary
+  const [phase, setPhase] = useState('main'); // main | selecting | confirmed | summary | learn-card | learn-reveal | learn-end
   const [vocabState, setVocabState] = useState({ wordStats: {}, sessions: [] });
   const [questions, setQuestions] = useState([]);
   const [qIdx, setQIdx] = useState(0);
@@ -3222,6 +3289,15 @@ function VocabPage({ showToast, profileName }) {
   const [marked, setMarked] = useState([]); // words marked unfamiliar this question
   const [results, setResults] = useState([]);
   const [loaded, setLoaded] = useState(false);
+
+  // ── Learn Words (flashcard) state ──
+  const [learnDeck, setLearnDeck] = useState([]);
+  const [learnIdx, setLearnIdx] = useState(0);
+  const [learnRatings, setLearnRatings] = useState({}); // { word: 'know'|'getting'|'learning' }
+  const [learnMissed, setLearnMissed] = useState([]);   // words rated "still learning" for retry loop
+  const [learnRetryMode, setLearnRetryMode] = useState(false);
+  const [learnSessionId, setLearnSessionId] = useState('');
+  const [learnMasteryChanges, setLearnMasteryChanges] = useState([]); // [{word, from, to}]
 
   useEffect(() => {
     getVocabState().then(s => { setVocabState(s); setLoaded(true); });
@@ -3264,7 +3340,7 @@ function VocabPage({ showToast, profileName }) {
 
     // Update word stats
     const ns = JSON.parse(JSON.stringify(vocabState));
-    const ensure = (w) => { if (!ns.wordStats[w]) ns.wordStats[w] = { unfamiliar: false, timesShown: 0, timesCorrect: 0, timesWrong: 0, lastSeen: 0 }; };
+    const ensure = (w) => { if (!ns.wordStats[w]) ns.wordStats[w] = { unfamiliar: false, timesShown: 0, timesCorrect: 0, timesWrong: 0, lastSeen: 0, masteryLevel: 0, consecutiveKnowIt: 0, lastReviewDate: 0, nextReviewDate: 0, interval: 0, sessionStreak: 0, lastStreakSession: 0 }; };
     ensure(q.targetWord);
     ns.wordStats[q.targetWord].timesShown++;
     ns.wordStats[q.targetWord].lastSeen = Date.now();
@@ -3303,6 +3379,150 @@ function VocabPage({ showToast, profileName }) {
     saveState(ns);
   };
 
+  // ── Learn Words: Start a flashcard session ──
+  const startLearnSession = (count) => {
+    const deck = buildFlashcardDeck(vocabState, count);
+    if (deck.length === 0) { showToast('No words available'); return; }
+    setLearnDeck(deck);
+    setLearnIdx(0);
+    setLearnRatings({});
+    setLearnMissed([]);
+    setLearnRetryMode(false);
+    setLearnSessionId('lsess-' + Date.now());
+    setLearnMasteryChanges([]);
+    setPhase('learn-card');
+  };
+
+  // ── Learn Words: Rate a card and advance ──
+  const rateLearnCard = (rating) => {
+    const word = learnDeck[learnIdx].word;
+    const ns = JSON.parse(JSON.stringify(vocabState));
+    const ensure = (w) => {
+      if (!ns.wordStats[w]) ns.wordStats[w] = {
+        unfamiliar: false, timesShown: 0, timesCorrect: 0, timesWrong: 0, lastSeen: 0,
+        masteryLevel: 0, consecutiveKnowIt: 0, lastReviewDate: 0, nextReviewDate: 0, interval: 0,
+        sessionStreak: 0, lastStreakSession: 0
+      };
+    };
+    ensure(word);
+    const ws = ns.wordStats[word];
+    const oldMastery = ws.masteryLevel || 0;
+    const now = Date.now();
+    const sessionTs = parseInt(learnSessionId.replace('lsess-', ''));
+
+    ws.lastReviewDate = now;
+
+    // Update ratings map
+    const newRatings = { ...learnRatings, [word]: rating };
+    setLearnRatings(newRatings);
+
+    if (rating === 'know') {
+      // "Know it": advance mastery via spaced repetition
+      ws.consecutiveKnowIt = (ws.consecutiveKnowIt || 0) + 1;
+      // Check if this is a different session from last streak session
+      const isNewSession = !ws.lastStreakSession || (sessionTs - ws.lastStreakSession > 3600000); // >1hr = new session
+      if (isNewSession) {
+        ws.sessionStreak = (ws.sessionStreak || 0) + 1;
+        ws.lastStreakSession = sessionTs;
+      }
+      // Mastery upgrade: need 3 consecutive "Know it" across different sessions for Mastered
+      if (ws.consecutiveKnowIt >= 3 && ws.sessionStreak >= 3) {
+        ws.masteryLevel = 3; // Mastered
+      } else if (ws.consecutiveKnowIt >= 2) {
+        ws.masteryLevel = Math.max(ws.masteryLevel || 0, 2); // Familiar
+      } else {
+        ws.masteryLevel = Math.max(ws.masteryLevel || 0, 1); // Learning
+      }
+      // Spaced interval
+      const intervalIdx = Math.min(ws.consecutiveKnowIt - 1, SPACED_INTERVALS.length - 1);
+      ws.interval = SPACED_INTERVALS[Math.max(0, intervalIdx)];
+      ws.nextReviewDate = now + ws.interval * 86400000;
+    } else if (rating === 'getting') {
+      // "Getting there": small progress, short interval
+      ws.masteryLevel = Math.max(ws.masteryLevel || 0, 1);
+      ws.consecutiveKnowIt = 0; // Reset streak
+      ws.interval = 1;
+      ws.nextReviewDate = now + 86400000; // Review tomorrow
+    } else {
+      // "Still learning": reset progress, retry in this session
+      ws.masteryLevel = Math.min(ws.masteryLevel || 0, 1);
+      ws.consecutiveKnowIt = 0;
+      ws.interval = 0;
+      ws.nextReviewDate = now; // Due immediately
+    }
+
+    // Track mastery changes for end screen
+    const newMastery = ws.masteryLevel;
+    const changes = [...learnMasteryChanges];
+    if (newMastery !== oldMastery) {
+      // Remove any existing change for this word (in case of retry)
+      const existing = changes.findIndex(c => c.word === word);
+      if (existing >= 0) changes[existing] = { word, from: changes[existing].from, to: newMastery };
+      else changes.push({ word, from: oldMastery, to: newMastery });
+      setLearnMasteryChanges(changes);
+    }
+
+    saveState(ns);
+
+    // Build missed list for retry
+    const missed = [];
+    if (rating === 'learning') {
+      // Add current word to missed if not already there
+      if (!learnMissed.includes(word)) missed.push(...learnMissed, word);
+      else missed.push(...learnMissed);
+    } else {
+      // Remove from missed if it was there (retry success)
+      missed.push(...learnMissed.filter(w => w !== word));
+    }
+    setLearnMissed(missed);
+
+    // Advance to next card
+    if (learnIdx + 1 < learnDeck.length) {
+      setLearnIdx(learnIdx + 1);
+      setPhase('learn-card');
+    } else if (!learnRetryMode && missed.length > 0) {
+      // Enter retry loop — go through missed words again
+      const retryDeck = missed.map(w => VOCAB_BANK.find(v => v.word === w)).filter(Boolean);
+      setLearnDeck(retryDeck);
+      setLearnIdx(0);
+      setLearnRetryMode(true);
+      setLearnMissed(missed);
+      setPhase('learn-card');
+      showToast('Let\'s review ' + missed.length + ' missed word' + (missed.length > 1 ? 's' : ''));
+    } else if (learnRetryMode && missed.length > 0) {
+      // Still have missed words in retry — loop again
+      const retryDeck = missed.map(w => VOCAB_BANK.find(v => v.word === w)).filter(Boolean);
+      setLearnDeck(retryDeck);
+      setLearnIdx(0);
+      setLearnMissed(missed);
+      setPhase('learn-card');
+    } else {
+      // All done
+      setPhase('learn-end');
+    }
+  };
+
+  // ── Learn Words: Count mastered today ──
+  const getMasteredToday = () => {
+    const today = new Date().setHours(0, 0, 0, 0);
+    const ws = vocabState.wordStats || {};
+    return Object.values(ws).filter(s =>
+      s.masteryLevel >= 3 && s.lastReviewDate && s.lastReviewDate >= today
+    ).length;
+  };
+
+  // ── Learn Words: Get overall learn stats ──
+  const getLearnStats = () => {
+    const ws = vocabState.wordStats || {};
+    const counts = [0, 0, 0, 0]; // new, learning, familiar, mastered
+    VOCAB_BANK.forEach(v => {
+      const s = ws[v.word];
+      const level = (s && s.masteryLevel) || 0;
+      counts[Math.min(level, 3)]++;
+    });
+    return counts;
+  };
+
   if (!loaded) return <div style={{padding: 24, textAlign: 'center', color: 'var(--text2)'}}>Loading vocabulary...</div>;
 
   // ===== MAIN VIEW =====
@@ -3313,26 +3533,72 @@ function VocabPage({ showToast, profileName }) {
     const totalCorrect = stats.reduce((s, x) => s + (x.timesCorrect || 0), 0);
     const accuracy = totalAttempts > 0 ? Math.round(totalCorrect / totalAttempts * 100) : 0;
     const recentSessions = (vocabState.sessions || []).slice(-5).reverse();
+    const masteredToday = getMasteredToday();
+    const learnCounts = getLearnStats(); // [new, learning, familiar, mastered]
+    const totalLearned = learnCounts[2] + learnCounts[3]; // familiar + mastered
 
     return (
       <div style={{maxWidth: 700, margin: '0 auto'}}>
         {/* Stats row */}
-        <div style={{display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 24}}>
+        <div style={{display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 24}}>
           {[
             { label: 'Word Bank', value: VOCAB_BANK.length, color: 'var(--accent2)' },
-            { label: 'Unfamiliar', value: unfamiliarWords.length, color: 'var(--orange)' },
-            { label: 'Accuracy', value: accuracy + '%', color: 'var(--green)' }
+            { label: 'Learned', value: totalLearned, color: 'var(--green)' },
+            { label: 'Mastered Today', value: masteredToday, color: '#ffd700' },
+            { label: 'Quiz Accuracy', value: accuracy + '%', color: 'var(--blue)' }
           ].map(s => (
-            <div key={s.label} className="card" style={{padding: '14px 12px', textAlign: 'center', borderTop: '3px solid ' + s.color}}>
-              <div style={{fontSize: 11, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6}}>{s.label}</div>
+            <div key={s.label} className="card" style={{padding: '14px 8px', textAlign: 'center', borderTop: '3px solid ' + s.color}}>
+              <div style={{fontSize: 10, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6}}>{s.label}</div>
               <div style={{fontSize: 22, fontWeight: 700}}>{s.value}</div>
             </div>
           ))}
         </div>
 
-        {/* Quick Start */}
+        {/* ── Learn Words section ── */}
         <div style={{marginBottom: 24}}>
-          <div style={{fontSize: 12, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10}}>Quick Start</div>
+          <div style={{fontSize: 12, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10}}>Learn Words</div>
+          <div className="card" style={{padding: '18px 20px'}}>
+            {/* Mastery progress bar */}
+            <div style={{display: 'flex', height: 8, borderRadius: 4, overflow: 'hidden', marginBottom: 14, background: 'var(--surface2)'}}>
+              {learnCounts[3] > 0 && <div style={{width: (learnCounts[3]/VOCAB_BANK.length*100)+'%', background: '#ffd700', transition: 'width 0.3s'}} title={learnCounts[3]+' Mastered'}></div>}
+              {learnCounts[2] > 0 && <div style={{width: (learnCounts[2]/VOCAB_BANK.length*100)+'%', background: 'var(--green)', transition: 'width 0.3s'}} title={learnCounts[2]+' Familiar'}></div>}
+              {learnCounts[1] > 0 && <div style={{width: (learnCounts[1]/VOCAB_BANK.length*100)+'%', background: 'var(--orange)', transition: 'width 0.3s'}} title={learnCounts[1]+' Learning'}></div>}
+            </div>
+            {/* Mastery level legend */}
+            <div style={{display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap'}}>
+              {MASTERY_LEVELS.map((m, i) => (
+                <div key={m.label} style={{display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--text2)'}}>
+                  <span>{m.icon}</span>
+                  <span>{m.label}</span>
+                  <span style={{fontWeight: 700, color: m.color}}>{learnCounts[i]}</span>
+                </div>
+              ))}
+            </div>
+            {/* Start buttons */}
+            <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10}}>
+              <button onClick={() => startLearnSession(5)}
+                style={{
+                  padding: '14px 12px', borderRadius: 10, border: '1px solid var(--accent)33',
+                  background: 'rgba(108,92,231,0.08)', cursor: 'pointer', textAlign: 'center', transition: 'all 0.15s'
+                }}>
+                <div style={{fontSize: 18, marginBottom: 2, fontWeight: 700, color: 'var(--accent2)'}}>5</div>
+                <div style={{fontSize: 12, fontWeight: 600, color: 'var(--text)'}}>Quick Session</div>
+              </button>
+              <button onClick={() => startLearnSession(10)}
+                style={{
+                  padding: '14px 12px', borderRadius: 10, border: '1px solid var(--blue)33',
+                  background: 'rgba(116,185,255,0.08)', cursor: 'pointer', textAlign: 'center', transition: 'all 0.15s'
+                }}>
+                <div style={{fontSize: 18, marginBottom: 2, fontWeight: 700, color: 'var(--blue)'}}>10</div>
+                <div style={{fontSize: 12, fontWeight: 600, color: 'var(--text)'}}>Full Session</div>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* ── Vocab Quiz section ── */}
+        <div style={{marginBottom: 24}}>
+          <div style={{fontSize: 12, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10}}>Vocab Quiz</div>
           <div style={{display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10}}>
             {[
               { label: '5 Words', icon: 'A', color: 'var(--accent2)', mode: 5 },
@@ -3616,6 +3882,272 @@ function VocabPage({ showToast, profileName }) {
           <button onClick={() => startQuiz(results.length)}
             style={{padding: '14px', borderRadius: 10, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 14, fontWeight: 600, cursor: 'pointer'}}>
             Practice Again
+          </button>
+          <button onClick={() => setPhase('main')}
+            style={{padding: '14px', borderRadius: 10, border: '1px solid var(--border)', background: 'var(--surface)', color: 'var(--text)', fontSize: 14, fontWeight: 600, cursor: 'pointer'}}>
+            Back to Vocab
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ===== LEARN WORDS: CARD FRONT (think of meaning) =====
+  if (phase === 'learn-card') {
+    const card = learnDeck[learnIdx];
+    if (!card) { setPhase('main'); return null; }
+    const mastery = getWordMastery(vocabState.wordStats, card.word);
+    const total = learnDeck.length;
+    const progress = learnIdx / total;
+    // SVG progress ring
+    const ringSize = 48, strokeW = 4;
+    const radius = (ringSize - strokeW) / 2;
+    const circumference = 2 * Math.PI * radius;
+    const dashOffset = circumference * (1 - (learnIdx + 1) / total);
+
+    return (
+      <div style={{maxWidth: 600, margin: '0 auto'}}>
+        {/* Top bar: progress ring + counter + exit */}
+        <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20}}>
+          <div style={{display: 'flex', alignItems: 'center', gap: 12}}>
+            {/* Progress ring */}
+            <svg width={ringSize} height={ringSize} style={{transform: 'rotate(-90deg)'}}>
+              <circle cx={ringSize/2} cy={ringSize/2} r={radius} fill="none" stroke="var(--surface2)" strokeWidth={strokeW} />
+              <circle cx={ringSize/2} cy={ringSize/2} r={radius} fill="none" stroke="var(--accent)" strokeWidth={strokeW}
+                strokeDasharray={circumference} strokeDashoffset={dashOffset}
+                strokeLinecap="round" style={{transition: 'stroke-dashoffset 0.4s ease'}} />
+            </svg>
+            <div>
+              <div style={{fontSize: 14, fontWeight: 700}}>{learnIdx + 1} / {total}</div>
+              <div style={{fontSize: 11, color: 'var(--text2)'}}>{learnRetryMode ? 'Review missed' : 'Flashcards'}</div>
+            </div>
+          </div>
+          <button onClick={() => { if (Object.keys(learnRatings).length > 0) setPhase('learn-end'); else setPhase('main'); }}
+            style={{background: 'none', border: 'none', color: 'var(--text2)', cursor: 'pointer', fontSize: 12}}>Exit</button>
+        </div>
+
+        {/* Flashcard — FRONT */}
+        <div
+          onClick={() => setPhase('learn-reveal')}
+          style={{
+            background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 16,
+            padding: '48px 32px', textAlign: 'center', cursor: 'pointer', minHeight: 260,
+            display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+            transition: 'all 0.2s', position: 'relative'
+          }}>
+          {/* Mastery badge */}
+          <div style={{position: 'absolute', top: 14, right: 16, display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: mastery.color}}>
+            <span>{mastery.icon}</span>
+            <span style={{fontWeight: 600}}>{mastery.label}</span>
+          </div>
+          <div style={{fontSize: 36, fontWeight: 700, color: 'var(--text)', marginBottom: 12, fontFamily: 'Georgia, serif'}}>{card.word}</div>
+          <div style={{fontSize: 14, color: 'var(--text2)', fontStyle: 'italic', marginBottom: 24}}>{card.pos}</div>
+          <div style={{fontSize: 12, color: 'var(--accent2)', opacity: 0.7}}>Think of the meaning, then tap to reveal</div>
+        </div>
+      </div>
+    );
+  }
+
+  // ===== LEARN WORDS: CARD BACK (reveal + rate) =====
+  if (phase === 'learn-reveal') {
+    const card = learnDeck[learnIdx];
+    if (!card) { setPhase('main'); return null; }
+    const mastery = getWordMastery(vocabState.wordStats, card.word);
+    const total = learnDeck.length;
+    const ringSize = 48, strokeW = 4;
+    const radius = (ringSize - strokeW) / 2;
+    const circumference = 2 * Math.PI * radius;
+    const dashOffset = circumference * (1 - (learnIdx + 1) / total);
+
+    // Highlight the word in the example sentence
+    const renderExample = (ex, word) => {
+      const idx = ex.toLowerCase().indexOf(word.toLowerCase());
+      if (idx < 0) return <span>{ex}</span>;
+      return <span>
+        {ex.slice(0, idx)}
+        <span style={{color: 'var(--accent2)', fontWeight: 700}}>{ex.slice(idx, idx + word.length)}</span>
+        {ex.slice(idx + word.length)}
+      </span>;
+    };
+
+    return (
+      <div style={{maxWidth: 600, margin: '0 auto'}}>
+        {/* Top bar */}
+        <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20}}>
+          <div style={{display: 'flex', alignItems: 'center', gap: 12}}>
+            <svg width={ringSize} height={ringSize} style={{transform: 'rotate(-90deg)'}}>
+              <circle cx={ringSize/2} cy={ringSize/2} r={radius} fill="none" stroke="var(--surface2)" strokeWidth={strokeW} />
+              <circle cx={ringSize/2} cy={ringSize/2} r={radius} fill="none" stroke="var(--accent)" strokeWidth={strokeW}
+                strokeDasharray={circumference} strokeDashoffset={dashOffset}
+                strokeLinecap="round" style={{transition: 'stroke-dashoffset 0.4s ease'}} />
+            </svg>
+            <div>
+              <div style={{fontSize: 14, fontWeight: 700}}>{learnIdx + 1} / {total}</div>
+              <div style={{fontSize: 11, color: 'var(--text2)'}}>{learnRetryMode ? 'Review missed' : 'Flashcards'}</div>
+            </div>
+          </div>
+          <button onClick={() => { if (Object.keys(learnRatings).length > 0) setPhase('learn-end'); else setPhase('main'); }}
+            style={{background: 'none', border: 'none', color: 'var(--text2)', cursor: 'pointer', fontSize: 12}}>Exit</button>
+        </div>
+
+        {/* Flashcard — BACK (revealed) */}
+        <div style={{
+          background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 16,
+          padding: '32px', minHeight: 260, position: 'relative'
+        }}>
+          {/* Mastery badge */}
+          <div style={{position: 'absolute', top: 14, right: 16, display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: mastery.color}}>
+            <span>{mastery.icon}</span>
+            <span style={{fontWeight: 600}}>{mastery.label}</span>
+          </div>
+          <div style={{textAlign: 'center', marginBottom: 20}}>
+            <div style={{fontSize: 28, fontWeight: 700, color: 'var(--text)', fontFamily: 'Georgia, serif'}}>{card.word}</div>
+            <div style={{fontSize: 13, color: 'var(--text2)', fontStyle: 'italic', marginTop: 4}}>{card.pos}</div>
+          </div>
+          <div style={{
+            background: 'var(--surface2)', borderRadius: 10, padding: '16px 20px', marginBottom: 16
+          }}>
+            <div style={{fontSize: 15, color: 'var(--text)', lineHeight: 1.6, fontWeight: 500}}>{card.def}</div>
+          </div>
+          <div style={{
+            borderLeft: '3px solid var(--accent)', paddingLeft: 16, fontSize: 14, color: 'var(--text2)',
+            lineHeight: 1.6, fontStyle: 'italic'
+          }}>
+            {renderExample(card.ex, card.word)}
+          </div>
+        </div>
+
+        {/* Self-rate buttons */}
+        <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginTop: 20}}>
+          <button onClick={() => rateLearnCard('learning')}
+            style={{
+              padding: '14px 8px', borderRadius: 10, border: '1px solid var(--red)44',
+              background: 'rgba(255,107,107,0.06)', cursor: 'pointer', textAlign: 'center', transition: 'all 0.15s'
+            }}>
+            <div style={{fontSize: 16, marginBottom: 4}}>&#x1F504;</div>
+            <div style={{fontSize: 12, fontWeight: 700, color: 'var(--red)'}}>Still learning</div>
+          </button>
+          <button onClick={() => rateLearnCard('getting')}
+            style={{
+              padding: '14px 8px', borderRadius: 10, border: '1px solid var(--orange)44',
+              background: 'rgba(253,203,110,0.06)', cursor: 'pointer', textAlign: 'center', transition: 'all 0.15s'
+            }}>
+            <div style={{fontSize: 16, marginBottom: 4}}>&#x1F914;</div>
+            <div style={{fontSize: 12, fontWeight: 700, color: 'var(--orange)'}}>Getting there</div>
+          </button>
+          <button onClick={() => rateLearnCard('know')}
+            style={{
+              padding: '14px 8px', borderRadius: 10, border: '1px solid var(--green)44',
+              background: 'rgba(0,206,201,0.06)', cursor: 'pointer', textAlign: 'center', transition: 'all 0.15s'
+            }}>
+            <div style={{fontSize: 16, marginBottom: 4}}>&#x2705;</div>
+            <div style={{fontSize: 12, fontWeight: 700, color: 'var(--green)'}}>Know it</div>
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ===== LEARN WORDS: END SCREEN =====
+  if (phase === 'learn-end') {
+    const rated = Object.entries(learnRatings);
+    const knowCount = rated.filter(([, r]) => r === 'know').length;
+    const gettingCount = rated.filter(([, r]) => r === 'getting').length;
+    const learningCount = rated.filter(([, r]) => r === 'learning').length;
+    const total = rated.length;
+
+    // Get current streak info (highest session streak among words reviewed)
+    const ws = vocabState.wordStats || {};
+    let maxStreak = 0;
+    rated.forEach(([word]) => {
+      const s = ws[word];
+      if (s && s.sessionStreak > maxStreak) maxStreak = s.sessionStreak;
+    });
+
+    return (
+      <div style={{maxWidth: 600, margin: '0 auto'}}>
+        {/* Session complete card */}
+        <div className="card" style={{textAlign: 'center', padding: '32px 24px', marginBottom: 24, borderTop: '3px solid var(--accent)'}}>
+          <div style={{fontSize: 14, color: 'var(--text2)', marginBottom: 8}}>Session Complete</div>
+          <div style={{fontSize: 44, fontWeight: 700, marginBottom: 8}}>{knowCount}/{total}</div>
+          <div style={{fontSize: 13, color: 'var(--text2)'}}>words you knew</div>
+          {maxStreak >= 2 && (
+            <div style={{
+              marginTop: 14, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 14px',
+              borderRadius: 20, background: 'rgba(255,215,0,0.1)', border: '1px solid rgba(255,215,0,0.3)'
+            }}>
+              <span style={{fontSize: 16}}>&#x1F525;</span>
+              <span style={{fontWeight: 700, color: '#ffd700', fontSize: 14}}>{maxStreak} session streak</span>
+            </div>
+          )}
+        </div>
+
+        {/* Rating breakdown */}
+        <div style={{display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10, marginBottom: 24}}>
+          {[
+            { label: 'Know it', count: knowCount, color: 'var(--green)', icon: '\u2705' },
+            { label: 'Getting there', count: gettingCount, color: 'var(--orange)', icon: '\uD83E\uDD14' },
+            { label: 'Still learning', count: learningCount, color: 'var(--red)', icon: '\uD83D\uDD04' }
+          ].map(b => (
+            <div key={b.label} className="card" style={{padding: '12px 8px', textAlign: 'center'}}>
+              <div style={{fontSize: 14, marginBottom: 4}}>{b.icon}</div>
+              <div style={{fontSize: 20, fontWeight: 700, color: b.color}}>{b.count}</div>
+              <div style={{fontSize: 10, color: 'var(--text2)', marginTop: 2}}>{b.label}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Mastery changes */}
+        {learnMasteryChanges.length > 0 && (
+          <div style={{marginBottom: 24}}>
+            <div style={{fontSize: 12, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10}}>
+              Mastery Changes
+            </div>
+            <div style={{display: 'grid', gap: 8}}>
+              {learnMasteryChanges.map(c => (
+                <div key={c.word} className="card" style={{padding: '10px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+                  <span style={{fontWeight: 600, fontSize: 14}}>{c.word}</span>
+                  <div style={{display: 'flex', alignItems: 'center', gap: 6, fontSize: 13}}>
+                    <span>{MASTERY_LEVELS[c.from].icon} {MASTERY_LEVELS[c.from].label}</span>
+                    <span style={{color: 'var(--text2)'}}>&#x2192;</span>
+                    <span style={{color: MASTERY_LEVELS[c.to].color, fontWeight: 600}}>{MASTERY_LEVELS[c.to].icon} {MASTERY_LEVELS[c.to].label}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Word list with final ratings */}
+        <div style={{marginBottom: 24}}>
+          <div style={{fontSize: 12, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10}}>
+            Words Reviewed ({total})
+          </div>
+          <div className="card" style={{padding: 0, overflow: 'hidden'}}>
+            {rated.map(([word, rating], i) => {
+              const m = getWordMastery(vocabState.wordStats, word);
+              const ratingColor = rating === 'know' ? 'var(--green)' : rating === 'getting' ? 'var(--orange)' : 'var(--red)';
+              return (
+                <div key={word} style={{
+                  padding: '10px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  borderTop: i > 0 ? '1px solid var(--border)' : 'none'
+                }}>
+                  <div style={{display: 'flex', alignItems: 'center', gap: 8}}>
+                    <span style={{fontSize: 12}}>{m.icon}</span>
+                    <span style={{fontWeight: 600, fontSize: 14}}>{word}</span>
+                  </div>
+                  <div style={{fontSize: 11, fontWeight: 600, color: ratingColor, textTransform: 'capitalize'}}>{rating === 'know' ? 'Know it' : rating === 'getting' ? 'Getting there' : 'Still learning'}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Actions */}
+        <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12}}>
+          <button onClick={() => startLearnSession(Object.keys(learnRatings).length)}
+            style={{padding: '14px', borderRadius: 10, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 14, fontWeight: 600, cursor: 'pointer'}}>
+            Learn More
           </button>
           <button onClick={() => setPhase('main')}
             style={{padding: '14px', borderRadius: 10, border: '1px solid var(--border)', background: 'var(--surface)', color: 'var(--text)', fontSize: 14, fontWeight: 600, cursor: 'pointer'}}>
