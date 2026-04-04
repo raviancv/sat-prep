@@ -748,40 +748,112 @@ async function initFirebase() {
   }
 }
 
-// Firestore document path: satPrep/{profileName}
-// Stores: sessions, testConfigs, questionFlags (gotWrong/reviewed/edits), vocabState
-function getCloudDocRef(profileName) {
+// ── Firestore Structure (subcollections to avoid 1MB doc limit) ──
+// satPrep/{profile}                → questionFlags, vocabState, meta
+// satPrep/{profile}/sessions/{id}  → individual session documents
+// satPrep/{profile}/configs/{id}   → individual test config documents
+function getProfileRef(profileName) {
   if (!_firestore || !_cloudReady) return null;
   return _firestore.collection('satPrep').doc(profileName);
 }
 
-// Pull all user data from Firestore for a profile
+// ── Pull all data from Firestore subcollections ──
 async function pullFromCloud(profileName) {
-  const ref = getCloudDocRef(profileName);
-  if (!ref) return null;
+  const profileRef = getProfileRef(profileName);
+  if (!profileRef) return null;
   try {
-    const doc = await ref.get();
-    if (!doc.exists) { console.log('[Cloud] No cloud data for profile:', profileName); return null; }
-    const data = doc.data();
-    console.log('[Cloud] Pulled data for', profileName, '— sessions:', (data.sessions || []).length, 'testConfigs:', (data.testConfigs || []).length);
-    return data;
+    // Pull main doc (flags + vocab) and subcollections in parallel
+    const [profileDoc, sessionsSnap, configsSnap] = await Promise.all([
+      profileRef.get(),
+      profileRef.collection('sessions').get(),
+      profileRef.collection('configs').get()
+    ]);
+
+    const hasAnything = profileDoc.exists || !sessionsSnap.empty || !configsSnap.empty;
+    if (!hasAnything) { console.log('[Cloud] No cloud data for profile:', profileName); return null; }
+
+    const profileData = profileDoc.exists ? profileDoc.data() : {};
+    const sessions = [];
+    sessionsSnap.forEach(doc => sessions.push(doc.data()));
+    const testConfigs = [];
+    configsSnap.forEach(doc => testConfigs.push(doc.data()));
+
+    console.log('[Cloud] Pulled data for', profileName,
+      '— sessions:', sessions.length, 'testConfigs:', testConfigs.length,
+      'flags:', Object.keys(profileData.questionFlags || {}).length);
+    return { ...profileData, sessions, testConfigs };
   } catch (e) {
     console.warn('[Cloud] Pull failed:', e.message);
     return null;
   }
 }
 
-// Push all user data to Firestore for a profile
+// ── Push data to Firestore using subcollections ──
 async function pushToCloud(profileName, payload) {
-  const ref = getCloudDocRef(profileName);
-  if (!ref) return;
+  const profileRef = getProfileRef(profileName);
+  if (!profileRef) return;
   try {
-    await ref.set({
-      ...payload,
+    const batch = _firestore.batch();
+    const writes = [];
+
+    // Main doc: questionFlags + vocabState (small — well under 1MB)
+    const mainDoc = {
       updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
       updatedBy: DEVICE_ID
-    }, { merge: true });
-    console.log('[Cloud] Pushed data for', profileName);
+    };
+    if (payload.questionFlags) mainDoc.questionFlags = payload.questionFlags;
+    if (payload.vocabState) mainDoc.vocabState = payload.vocabState;
+    batch.set(profileRef, mainDoc, { merge: true });
+
+    // Sessions as individual subcollection docs
+    if (payload.sessions) {
+      for (const s of payload.sessions) {
+        if (!s.id) continue;
+        const ref = profileRef.collection('sessions').doc(s.id);
+        batch.set(ref, s, { merge: true });
+        writes.push(s.id);
+      }
+    }
+
+    // Test configs as individual subcollection docs
+    if (payload.testConfigs) {
+      for (const c of payload.testConfigs) {
+        if (!c.id) continue;
+        const ref = profileRef.collection('configs').doc(c.id);
+        batch.set(ref, c, { merge: true });
+        writes.push(c.id);
+      }
+    }
+
+    // Firestore batch limit is 500 writes. If we exceed, split into chunks.
+    if (writes.length + 1 <= 500) {
+      await batch.commit();
+    } else {
+      // Fall back to individual writes for large payloads
+      await profileRef.set(mainDoc, { merge: true });
+      const writePromises = [];
+      if (payload.sessions) {
+        for (const s of payload.sessions) {
+          if (!s.id) continue;
+          writePromises.push(profileRef.collection('sessions').doc(s.id).set(s, { merge: true }));
+        }
+      }
+      if (payload.testConfigs) {
+        for (const c of payload.testConfigs) {
+          if (!c.id) continue;
+          writePromises.push(profileRef.collection('configs').doc(c.id).set(c, { merge: true }));
+        }
+      }
+      // Batch in groups of 50 to avoid overwhelming Firestore
+      for (let i = 0; i < writePromises.length; i += 50) {
+        await Promise.all(writePromises.slice(i, i + 50));
+      }
+    }
+
+    console.log('[Cloud] Pushed data for', profileName,
+      '(sessions:', (payload.sessions || []).length,
+      ', configs:', (payload.testConfigs || []).length,
+      ', flags:', Object.keys(payload.questionFlags || {}).length, ')');
   } catch (e) {
     console.warn('[Cloud] Push failed:', e.message);
   }
@@ -808,16 +880,15 @@ async function buildCloudPayload(profileName) {
     if (q.reviewed) flags.reviewed = true;
     if (q.needsContentReview) flags.needsContentReview = true;
     if (q.contentIssues && q.contentIssues.length > 0) flags.contentIssues = q.contentIssues;
-    // Only include if there's something to sync
     if (Object.keys(flags).length > 0) questionFlags[q.id] = flags;
   });
 
   return { sessions, testConfigs, questionFlags, vocabState };
 }
 
-// Merge cloud data into local IDB
+// ── Merge cloud data into local IDB ──
 async function mergeCloudIntoLocal(profileName, cloudData) {
-  if (!cloudData) return { merged: false };
+  if (!cloudData) return { merged: false, changes: 0 };
   let changes = 0;
 
   // Merge sessions — add any missing (by ID)
@@ -844,7 +915,7 @@ async function mergeCloudIntoLocal(profileName, cloudData) {
     }
   }
 
-  // Merge question flags — apply gotWrong/reviewed from cloud to local questions
+  // Merge question flags
   if (cloudData.questionFlags) {
     const questions = await getAllQuestions();
     const toUpdate = [];
@@ -893,21 +964,49 @@ async function mergeCloudIntoLocal(profileName, cloudData) {
   return { merged: true, changes };
 }
 
-// Set up real-time listener for a profile
+// Set up real-time listeners for a profile (main doc + subcollections)
 function listenToCloud(profileName, onUpdate) {
-  const ref = getCloudDocRef(profileName);
-  if (!ref) return () => {};
-  return ref.onSnapshot(
+  const profileRef = getProfileRef(profileName);
+  if (!profileRef) return () => {};
+
+  // Debounce: aggregate changes from multiple listeners before calling onUpdate
+  let _listenerTimer = null;
+  function triggerUpdate() {
+    if (_listenerTimer) clearTimeout(_listenerTimer);
+    _listenerTimer = setTimeout(async () => {
+      try {
+        const fullData = await pullFromCloud(profileName);
+        if (fullData && fullData.updatedBy !== DEVICE_ID) {
+          console.log('[Cloud] Remote update detected, re-pulling full data');
+          onUpdate(fullData);
+        }
+      } catch (e) { console.warn('[Cloud] Listener update error:', e.message); }
+    }, 1500);
+  }
+
+  // Listen to main profile doc (flags, vocab)
+  const unsub1 = profileRef.onSnapshot(
     (doc) => {
       if (!doc.exists) return;
-      const data = doc.data();
-      // Ignore our own writes
-      if (data.updatedBy === DEVICE_ID) return;
-      console.log('[Cloud] Remote update detected from', data.updatedBy);
-      onUpdate(data);
+      if (doc.data().updatedBy === DEVICE_ID) return;
+      triggerUpdate();
     },
-    (err) => console.warn('[Cloud] Listener error:', err.message)
+    (err) => console.warn('[Cloud] Profile listener error:', err.message)
   );
+
+  // Listen to sessions subcollection
+  const unsub2 = profileRef.collection('sessions').onSnapshot(
+    () => triggerUpdate(),
+    (err) => console.warn('[Cloud] Sessions listener error:', err.message)
+  );
+
+  // Listen to configs subcollection
+  const unsub3 = profileRef.collection('configs').onSnapshot(
+    () => triggerUpdate(),
+    (err) => console.warn('[Cloud] Configs listener error:', err.message)
+  );
+
+  return () => { unsub1(); unsub2(); unsub3(); };
 }
 
 // === Migration from localStorage (one-time) ===
