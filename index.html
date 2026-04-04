@@ -13,6 +13,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<!-- Audio sync uses Firestore subcollection (no Storage SDK needed — stays on free Spark plan) -->
 <style>
   /* KaTeX sizing: bump up from default 1.21em and add breathing room */
   .katex { font-size: 1.35em !important; }
@@ -728,6 +729,7 @@ let _firestore = null;
 let _cloudReady = false;
 let _syncDebounceTimer = null;
 let _lastPushTimestamp = 0; // Track when we last pushed to cloud (for listener loop fix)
+let _audioSyncInProgress = false; // Prevent concurrent audio syncs
 const DEVICE_ID = 'dev_' + (localStorage.getItem('sat_device_id') || (() => { const id = Math.random().toString(36).substr(2, 8); localStorage.setItem('sat_device_id', id); return id; })());
 
 async function initFirebase() {
@@ -749,10 +751,138 @@ async function initFirebase() {
   }
 }
 
+// ── Audio Cloud Sync via Firestore subcollection ──
+// Each audio recording is stored as its own Firestore document (under 1MB each).
+// Path: satPrep/{profile}/audio/{sessionId}_{questionId}  (or _{questionId}_followup)
+// This uses the free Spark plan — no Firebase Storage or Blaze upgrade needed.
+
+function getAudioDocId(sessionId, questionId, isFollowUp) {
+  return sessionId + '_' + questionId + (isFollowUp ? '_followup' : '');
+}
+
+async function pushAudioToCloud(profileName, sessionId, questionId, base64Data, transcript, isFollowUp) {
+  if (!_firestore || !_cloudReady || !base64Data) return false;
+  const profileRef = getProfileRef(profileName);
+  if (!profileRef) return false;
+  try {
+    const docId = getAudioDocId(sessionId, questionId, isFollowUp);
+    // Check base64 size — Firestore doc limit is 1MB
+    const sizeKB = Math.round(base64Data.length * 0.75 / 1024); // base64 → actual bytes
+    if (sizeKB > 900) {
+      console.warn('[Audio] Recording too large for Firestore (' + sizeKB + 'KB), skipping', docId);
+      return false;
+    }
+    await profileRef.collection('audio').doc(docId).set({
+      sessionId, questionId, isFollowUp: !!isFollowUp,
+      audioBase64: base64Data,
+      transcript: transcript || '',
+      sizeKB,
+      uploadedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      uploadedBy: DEVICE_ID
+    });
+    console.log('[Audio] Pushed', docId, '(' + sizeKB + 'KB)');
+    return true;
+  } catch (e) {
+    console.warn('[Audio] Push failed for', questionId + ':', e.message);
+    return false;
+  }
+}
+
+async function pullAudioFromCloud(profileName, sessionId, questionId, isFollowUp) {
+  if (!_firestore || !_cloudReady) return null;
+  const profileRef = getProfileRef(profileName);
+  if (!profileRef) return null;
+  try {
+    const docId = getAudioDocId(sessionId, questionId, isFollowUp);
+    const doc = await profileRef.collection('audio').doc(docId).get();
+    if (!doc.exists) return null;
+    const data = doc.data();
+    console.log('[Audio] Pulled', docId, '(' + (data.sizeKB || '?') + 'KB)');
+    return { audioBase64: data.audioBase64, transcript: data.transcript || '' };
+  } catch (e) {
+    console.warn('[Audio] Pull failed for', questionId + ':', e.message);
+    return null;
+  }
+}
+
+// Upload all audio from a session to Firestore audio subcollection
+async function uploadSessionAudio(profileName, session) {
+  if (!session || !session.results || !_firestore) return { uploaded: 0 };
+  let uploadCount = 0;
+
+  for (const r of session.results) {
+    if (!r.review) continue;
+
+    // Upload main recording if not already synced
+    if (r.review.audioBase64 && !r.review.audioSynced) {
+      const ok = await pushAudioToCloud(profileName, session.id, r.questionId, r.review.audioBase64, r.review.transcript, false);
+      if (ok) {
+        r.review.audioSynced = true;
+        uploadCount++;
+      }
+    }
+
+    // Upload follow-up recording
+    if (r.review.followUp && r.review.followUp.audioBase64 && !r.review.followUp.audioSynced) {
+      const ok = await pushAudioToCloud(profileName, session.id, r.questionId, r.review.followUp.audioBase64, r.review.followUp.transcript, true);
+      if (ok) {
+        r.review.followUp.audioSynced = true;
+        uploadCount++;
+      }
+    }
+  }
+
+  if (uploadCount > 0) {
+    // Save audioSynced flags back to IDB so we don't re-upload
+    await putSession(session);
+    console.log('[Audio] Uploaded', uploadCount, 'recordings for session', session.id);
+  }
+  return { uploaded: uploadCount };
+}
+
+// Download missing audio for a session from Firestore
+async function downloadSessionAudio(profileName, session) {
+  if (!session || !session.results || !_firestore) return { session, downloaded: 0 };
+  let downloadCount = 0;
+
+  for (const r of session.results) {
+    if (!r.review) continue;
+
+    // Download main recording if session says hasAudio but we don't have the base64
+    if (r.review.hasAudio && !r.review.audioBase64) {
+      const data = await pullAudioFromCloud(profileName, session.id, r.questionId, false);
+      if (data) {
+        r.review.audioBase64 = data.audioBase64;
+        r.review.audioSynced = true;
+        if (data.transcript && !r.review.transcript) r.review.transcript = data.transcript;
+        downloadCount++;
+      }
+    }
+
+    // Download follow-up
+    if (r.review.followUp && r.review.followUp.hasAudio && !r.review.followUp.audioBase64) {
+      const data = await pullAudioFromCloud(profileName, session.id, r.questionId, true);
+      if (data) {
+        r.review.followUp.audioBase64 = data.audioBase64;
+        r.review.followUp.audioSynced = true;
+        if (data.transcript && !r.review.followUp.transcript) r.review.followUp.transcript = data.transcript;
+        downloadCount++;
+      }
+    }
+  }
+
+  if (downloadCount > 0) {
+    await putSession(session);
+    console.log('[Audio] Downloaded', downloadCount, 'recordings for session', session.id);
+  }
+  return { session, downloaded: downloadCount };
+}
+
 // ── Firestore Structure (subcollections to avoid 1MB doc limit) ──
 // satPrep/{profile}                → questionFlags, vocabState, meta
-// satPrep/{profile}/sessions/{id}  → individual session documents (audio stored in Firebase Storage)
+// satPrep/{profile}/sessions/{id}  → individual session documents (audio metadata only)
 // satPrep/{profile}/configs/{id}   → individual test config documents
+// satPrep/{profile}/audio/{id}     → individual audio recordings (base64, <1MB each)
 function getProfileRef(profileName) {
   if (!_firestore || !_cloudReady) return null;
   return _firestore.collection('satPrep').doc(profileName);
@@ -797,13 +927,23 @@ function sanitizeSessionForCloud(session) {
     results: session.results.map(r => {
       const clean = { ...r };
       if (clean.review) {
-        clean.review = {
+        const rev = {
           errorCategory: clean.review.errorCategory || null,
           notes: clean.review.notes || '',
           hasAudio: clean.review.hasAudio || false,
           transcript: clean.review.transcript || ''
-          // audioBase64, audioBlob, audioUrl stripped — too large for Firestore
+          // audioBase64, audioBlob, audioUrl stripped — synced via audio subcollection
         };
+        if (clean.review.quickTag) rev.quickTag = clean.review.quickTag;
+        // Keep follow-up metadata (audio data synced separately via audio subcollection)
+        if (clean.review.followUp) {
+          rev.followUp = {
+            transcript: clean.review.followUp.transcript || '',
+            hasAudio: clean.review.followUp.hasAudio || false,
+            recordedAt: clean.review.followUp.recordedAt || ''
+          };
+        }
+        clean.review = rev;
       }
       return clean;
     })
@@ -824,7 +964,7 @@ async function pushToCloud(profileName, payload) {
     if (payload.vocabState) mainDoc.vocabState = payload.vocabState;
     await profileRef.set(mainDoc, { merge: true });
 
-    // 2. Write sessions individually (audio stripped — stays local-only)
+    // 2. Write sessions to Firestore (metadata only — audio synced separately)
     if (payload.sessions && payload.sessions.length > 0) {
       for (const s of payload.sessions) {
         if (!s.id) continue;
@@ -877,6 +1017,51 @@ async function buildCloudPayload(profileName) {
   return { sessions, testConfigs, questionFlags, vocabState };
 }
 
+// ── Background audio sync: upload local audio to Firestore, download missing audio ──
+async function backgroundAudioSync(profileName) {
+  if (!_firestore || !_cloudReady || _audioSyncInProgress) return;
+  _audioSyncInProgress = true;
+  try {
+    const sessions = await getSessionsForProfile(profileName);
+    let totalDownloads = 0;
+    let totalUploads = 0;
+
+    for (const session of sessions) {
+      if (!session.results) continue;
+
+      // Upload: local audio not yet synced to cloud
+      const needsUpload = session.results.some(r =>
+        (r.review?.audioBase64 && !r.review?.audioSynced) ||
+        (r.review?.followUp?.audioBase64 && !r.review?.followUp?.audioSynced)
+      );
+      if (needsUpload) {
+        const { uploaded } = await uploadSessionAudio(profileName, session);
+        totalUploads += uploaded;
+      }
+
+      // Download: session says hasAudio but we don't have base64 locally
+      const needsDownload = session.results.some(r =>
+        (r.review?.hasAudio && !r.review?.audioBase64) ||
+        (r.review?.followUp?.hasAudio && !r.review?.followUp?.audioBase64)
+      );
+      if (needsDownload) {
+        const { downloaded } = await downloadSessionAudio(profileName, session);
+        totalDownloads += downloaded;
+      }
+    }
+
+    if (totalDownloads > 0 || totalUploads > 0) {
+      console.log('[Audio] Background sync: uploaded', totalUploads, ', downloaded', totalDownloads);
+    } else {
+      console.log('[Audio] Background sync: all audio in sync');
+    }
+  } catch (e) {
+    console.warn('[Audio] Background sync error:', e.message);
+  } finally {
+    _audioSyncInProgress = false;
+  }
+}
+
 // ── Merge cloud data into local IDB ──
 async function mergeCloudIntoLocal(profileName, cloudData) {
   if (!cloudData) return { merged: false, changes: 0 };
@@ -886,9 +1071,10 @@ async function mergeCloudIntoLocal(profileName, cloudData) {
   if (cloudData.sessions && cloudData.sessions.length > 0) {
     const localSessions = await getSessionsForProfile(profileName);
     const localIds = new Set(localSessions.map(s => s.id));
-    for (const s of cloudData.sessions) {
-      if (!localIds.has(s.id)) {
-        await putSession(s);
+    for (const cloudSession of cloudData.sessions) {
+      if (!localIds.has(cloudSession.id)) {
+        // New session from cloud — save it (audio will be downloaded in background sync)
+        await putSession(cloudSession);
         changes++;
       }
     }
@@ -4454,6 +4640,12 @@ function App() {
             } catch (err) {
               console.warn('[Cloud] Error processing remote update:', err);
             }
+          });
+
+          // Background audio sync: upload local audio to Storage, download missing audio
+          // Runs async in background — doesn't block UI loading
+          backgroundAudioSync(active).then(() => {
+            console.log('[Storage] Background audio sync complete');
           });
         }
 
