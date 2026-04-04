@@ -13,7 +13,6 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-storage-compat.js"></script>
 <style>
   /* KaTeX sizing: bump up from default 1.21em and add breathing room */
   .katex { font-size: 1.35em !important; }
@@ -749,47 +748,6 @@ async function initFirebase() {
   }
 }
 
-// ── Firebase Storage: audio file upload/download ──
-let _storage = null;
-function getStorage() {
-  if (!_storage && _cloudReady) _storage = firebase.storage();
-  return _storage;
-}
-
-// Upload audio base64 to Firebase Storage, returns download URL
-async function uploadAudioToStorage(profileName, sessionId, questionId, base64Data) {
-  const storage = getStorage();
-  if (!storage || !base64Data) return null;
-  try {
-    // base64Data is a data URL like "data:audio/webm;base64,..."
-    const ref = storage.ref(`satPrep/${profileName}/audio/${sessionId}_${questionId}.webm`);
-    await ref.putString(base64Data, 'data_url');
-    const url = await ref.getDownloadURL();
-    return url;
-  } catch (e) {
-    console.warn('[Cloud] Audio upload failed for', questionId, ':', e.message);
-    return null;
-  }
-}
-
-// Download audio from Firebase Storage URL and return as base64 data URL
-async function downloadAudioFromStorage(url) {
-  if (!url || !url.startsWith('https://')) return null;
-  try {
-    const response = await fetch(url);
-    const blob = await response.blob();
-    return new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onloadend = () => resolve(reader.result);
-      reader.onerror = () => resolve(null);
-      reader.readAsDataURL(blob);
-    });
-  } catch (e) {
-    console.warn('[Cloud] Audio download failed:', e.message);
-    return null;
-  }
-}
-
 // ── Firestore Structure (subcollections to avoid 1MB doc limit) ──
 // satPrep/{profile}                → questionFlags, vocabState, meta
 // satPrep/{profile}/sessions/{id}  → individual session documents (audio stored in Firebase Storage)
@@ -830,33 +788,25 @@ async function pullFromCloud(profileName) {
   }
 }
 
-// Prepare a session for cloud: upload audio to Storage, strip base64 from Firestore doc
-async function prepareSessionForCloud(profileName, session) {
+// Strip audio data from session before cloud push (audio stays local-only for now)
+function sanitizeSessionForCloud(session) {
   if (!session || !session.results) return session;
-  const results = [];
-  for (const r of session.results) {
-    const clean = { ...r };
-    if (clean.review) {
-      clean.review = { ...clean.review };
-      const audioData = clean.review.audioBase64 || clean.review.audioBlob;
-      // Upload audio to Firebase Storage if present
-      if (audioData && typeof audioData === 'string' && audioData.startsWith('data:')) {
-        const storageUrl = await uploadAudioToStorage(profileName, session.id, r.questionId, audioData);
-        if (storageUrl) {
-          clean.review.audioStorageUrl = storageUrl;
-          clean.review.hasAudio = true;
-        }
-      } else if (clean.review.audioStorageUrl) {
-        // Already has a storage URL — keep it
+  return {
+    ...session,
+    results: session.results.map(r => {
+      const clean = { ...r };
+      if (clean.review) {
+        clean.review = {
+          errorCategory: clean.review.errorCategory || null,
+          notes: clean.review.notes || '',
+          hasAudio: clean.review.hasAudio || false,
+          transcript: clean.review.transcript || ''
+          // audioBase64, audioBlob, audioUrl stripped — too large for Firestore
+        };
       }
-      // Strip local-only data that can't go to Firestore
-      delete clean.review.audioBase64;
-      delete clean.review.audioBlob;
-      delete clean.review.audioUrl; // blob: URLs are local-only
-    }
-    results.push(clean);
-  }
-  return { ...session, results };
+      return clean;
+    })
+  };
 }
 
 // ── Push data to Firestore using individual writes (avoids 10MB batch limit) ──
@@ -873,15 +823,11 @@ async function pushToCloud(profileName, payload) {
     if (payload.vocabState) mainDoc.vocabState = payload.vocabState;
     await profileRef.set(mainDoc, { merge: true });
 
-    // 2. Write sessions individually — audio goes to Firebase Storage
-    let audioCount = 0;
+    // 2. Write sessions individually (audio stripped — stays local-only)
     if (payload.sessions && payload.sessions.length > 0) {
       for (const s of payload.sessions) {
         if (!s.id) continue;
-        const prepared = await prepareSessionForCloud(profileName, s);
-        const hasAudioResults = prepared.results.filter(r => r.review?.audioStorageUrl);
-        audioCount += hasAudioResults.length;
-        await profileRef.collection('sessions').doc(s.id).set(prepared);
+        await profileRef.collection('sessions').doc(s.id).set(sanitizeSessionForCloud(s));
       }
     }
 
@@ -896,8 +842,7 @@ async function pushToCloud(profileName, payload) {
     console.log('[Cloud] Pushed data for', profileName,
       '(sessions:', (payload.sessions || []).length,
       ', configs:', (payload.testConfigs || []).length,
-      ', flags:', Object.keys(payload.questionFlags || {}).length,
-      ', audio files:', audioCount, ')');
+      ', flags:', Object.keys(payload.questionFlags || {}).length, ')');
   } catch (e) {
     console.warn('[Cloud] Push failed:', e.message);
   }
@@ -935,24 +880,12 @@ async function mergeCloudIntoLocal(profileName, cloudData) {
   if (!cloudData) return { merged: false, changes: 0 };
   let changes = 0;
 
-  // Merge sessions — add any missing (by ID), download audio from Storage
+  // Merge sessions — add any missing (by ID)
   if (cloudData.sessions && cloudData.sessions.length > 0) {
     const localSessions = await getSessionsForProfile(profileName);
     const localIds = new Set(localSessions.map(s => s.id));
     for (const s of cloudData.sessions) {
       if (!localIds.has(s.id)) {
-        // Download audio from Firebase Storage for results that have audioStorageUrl
-        if (s.results) {
-          for (const r of s.results) {
-            if (r.review?.audioStorageUrl && !r.review?.audioBase64) {
-              const base64 = await downloadAudioFromStorage(r.review.audioStorageUrl);
-              if (base64) {
-                r.review.audioBase64 = base64;
-                r.review.audioUrl = base64; // For immediate playback
-              }
-            }
-          }
-        }
         await putSession(s);
         changes++;
       }
