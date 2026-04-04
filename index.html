@@ -3802,11 +3802,15 @@ function App() {
               setTestConfigs(updatedConfigs);
               console.log('[Cloud] UI updated with cloud-merged data');
             }
-          } else {
-            // Cloud is empty — seed it with local data
-            const payload = await buildCloudPayload(active);
-            await pushToCloud(active, payload);
-            console.log('[Cloud] Seeded cloud with local data');
+          }
+          // Always push local state to cloud (merges with existing cloud data)
+          // This ensures the device with the most data wins
+          const initPayload = await buildCloudPayload(active);
+          const localSessionCount = (initPayload.sessions || []).length;
+          const cloudSessionCount = (cloudData?.sessions || []).length;
+          if (localSessionCount > 0 || !cloudData) {
+            await pushToCloud(active, initPayload);
+            console.log('[Cloud] Pushed local data to cloud (local sessions:', localSessionCount, ', cloud sessions:', cloudSessionCount, ')');
           }
 
           // Start real-time listener for remote changes
