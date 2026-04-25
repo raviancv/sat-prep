@@ -6962,15 +6962,15 @@
     "questionText": "A team hosting an event to raise money for new uniforms plans to sell at least 140 tickets before this event and at least 220 tickets during this event to raise a total of at least $\\$ 5,820$ from all tickets sold. The price of a ticket during this event is $\\$ 3$ less than the price of a ticket before this event. Which inequality represents this situation, where $x$ is the price, in dollars, of a ticket sold during this event?",
     "type": "mc",
     "choices": [
-      "$140(x+3)+220 $x \\leq 5$,820$",
-      "$140(x+3)+220 $x \\geq 5$,820$",
-      "$140(x-3)+220 $x \\leq 5$,820$",
-      "$140(x-3)+220 $x \\geq 5$,820$"
+      "$140(x+3)+220x \\leq 5{,}820$",
+      "$140(x+3)+220x \\geq 5{,}820$",
+      "$140(x-3)+220x \\leq 5{,}820$",
+      "$140(x-3)+220x \\geq 5{,}820$"
     ],
     "correctAnswer": "B",
     "rationale": "Choice B is correct. It's given that a team plans to sell at least 140 tickets before an event and at least 220 tickets during the event to raise a total of at least $\\$ 5,820$ from all tickets sold. It's also given that the price of a ticket during the event is $\\$ 3$ less than the price of a ticket before the event and that $x$ represents the price, in dollars, of a ticket sold during the event. It follows that $x+3$ represents the price, in dollars, of a ticket sold before the event. The expression $140(x+3)$ represents the planned revenue, in dollars, from the tickets sold before the event, and the expression $220 x$ represents the planned revenue, in dollars, from the tickets sold during the event. Thus, the expression $140(x+3)+220 x$ represents the planned revenue, in dollars, from all tickets sold. Since the team plans to raise a total of at least $\\$ 5,820$ from all tickets sold, the total revenue must be at least $\\$ 5,820$. Therefore, the inequality $140(x+3)+220 $x \\geq 5$,820$ represents this situation. Choice A is incorrect. This inequality represents a situation in which the team raises a total of at most $\\$ 5,820$ from all tickets sold. Choice C is incorrect. This inequality represents a situation in which the price of a ticket before the event is $\\$ 3$ less, rather than $\\$ 3$ more, than the price of a ticket during the event and the team raises a total of at most $\\$ 5,820$ from all tickets sold. Choice D is incorrect. This inequality represents a situation in which the price of a ticket before the event is $\\$ 3$ less, rather than $\\$ 3$ more, than the price of a ticket during the event.",
     "pdfFile": "55ea82f3.pdf",
-    "questionImage": "",
+    "questionImage": "SAT-Question-Bank/Images/55ea82f3.png",
     "validationStatus": "",
     "reviewed": false,
     "gotWrong": false,
@@ -7387,7 +7387,7 @@
       "$(-3,0)$",
       "$(-4,0)$",
       "$(-9,0)$",
-      "$(-12,0)$ ID: 78391 fcc Answer Correct Answer: B Rationale"
+      "$(-12,0)$"
     ],
     "correctAnswer": "B",
     "rationale": "Choice B is correct. The equation of a linear function can be written in the form $y=m x+b$, where $y=f(x)$, $m$ is the slope of the graph of $y=f(x)$, and b is the y -coordinate of the y -intercept of the graph. The value of m can be found using the slope formula, $m=\\frac{y_{2}-y_{1}}{x_{2}-x_{1}}$ According to the table, the points $(-11,21)$ and $(-10,18)$ lie on the graph of $y=f(x)$. Using these two points in the slope formula yields $m=\\frac{18-21}{-10+11}$, or -3 . Substituting -3 for $m$ in the slope-intercept form of the equation yields $y=-3 x+b$. The value of $b$ can be found by substituting values from the table and solving; for example, substituting the coordinates of the point $(-11,21)$ into the equation $y=-3 x+b$ gives $21=-3(-11)+b$, which yields $b=-12$. This means the function given by the table can be represented by the equation $y=-3 x-12$. The value of the x -intercept of the graph of $y=f(x)$ can be determined by finding the value of x when $y=0$. Substituting $y=0$ into $y=-3 x-12$ yields $0=-3 x-12$, or $x=-4$. This corresponds to the point $(-4,0)$. Choice A is incorrect and may result from substituting the value of the slope for the x-coordinate of the x-intercept. Choice C is incorrect and may result from a calculation error. Choice D is incorrect and may result from substituting the y -coordinate of the y -intercept for the x coordinate of the x-intercept. Question Difficulty: Hard",
@@ -7396,10 +7396,8 @@
     "validationStatus": "",
     "reviewed": false,
     "gotWrong": false,
-    "needsContentReview": true,
-    "contentIssues": [
-      "possible_missing_formula"
-    ]
+    "needsContentReview": false,
+    "contentIssues": []
   },
   {
     "source": "College Board",
@@ -12186,15 +12184,12 @@
     "correctAnswer": "either",
     "rationale": "The correct answer is either $\\frac{10}{3}, \\frac{15}{4}$, or $\\frac{25}{6}$. The area of triangle $A B C$ can be expressed as $\\frac{1}{2}(5+7) y$ or $6 y$. It's given that the area of triangle ABC is at least 48 but no more than 60 . It follows that $48 \\leq 6 $y \\leq 6$0$. Dividing by 6 to isolate $y$ in this compound inequality yields $8 \\leq $y \\leq 1$0$. Since $y$ is an integer, $y=8,90$ or 10 . In the given figure, the two right triangles shown are similar because they have two pairs of congruent angles: their respective right angles and angle $A$. Therefore, the following proportion is true: $\\frac{x}{y}=\\frac{5}{12}$. Substituting 8 for $y$ in the proportion results in $\\frac{x}{8}=\\frac{5}{12}$. Cross multiplying and solving for $x$ yields $\\frac{10}{3}$. Substituting 9 for $y$ in the proportion results in $\\frac{x}{9}=\\frac{5}{12}$. Cross multiplying and solving for $x$ yields $\\frac{15}{4}$. Substituting 10 for $y$ in the proportion results in $\\frac{x}{10}=\\frac{5}{12}$. Cross multiplying and solving for $x$ yields $\\frac{25}{6}$. Note that $10 / 3,15 / 4,25 / 6,3.333,3.75,4.166$, and 4.167 are examples of ways to enter a correct answer.",
     "pdfFile": "eeb4143c.pdf",
-    "questionImage": "",
+    "questionImage": "SAT-Question-Bank/Images/eeb4143c.png",
     "validationStatus": "",
     "reviewed": false,
     "gotWrong": false,
-    "needsContentReview": true,
-    "contentIssues": [
-      "possible_missing_formula",
-      "possible_missing_formula"
-    ]
+    "needsContentReview": false,
+    "contentIssues": []
   },
   {
     "source": "College Board",
@@ -12674,23 +12669,19 @@
     "skill": "Right triangles and trigonometry",
     "concept": "",
     "difficulty": "Hard",
-    "passage": "In the triangle shown, .",
+    "passage": "",
     "questionText": "Note: Figure not drawn to scale. In the triangle shown, $R S=\\sqrt{105}$. What is the value of $\\sin R$ ?",
     "type": "free",
     "choices": [],
     "correctAnswer": ".9811, 52/53",
     "rationale": "The correct answer is $\\frac{52}{53}$. In a right triangle, the square of the length of the hypotenuse is equal to the sum of the squares of the lengths of the two legs. The length of the hypotenuse of the right triangle shown is 53 . It's given that $R S=\\sqrt{105}$. Therefore, the length of one of the legs of the triangle shown is $\\sqrt{105}$. Let $x$ represent $T S$, the length of the other leg of the triangle shown. Therefore, $53^{2}=(\\sqrt{105})^{2}+x^{2}$, or $2,809=105+x^{2}$. Subtracting 105 from both sides of this equation yields $2,704=x^{2}$. Taking the positive square root of both sides of this equation yields $52=x$. Therefore, $T S$, the length of the other leg of the triangle shown, is 52 . The sine of an acute angle in a right triangle is defined as the ratio of the length of the leg opposite the angle to the length of the hypotenuse. The length of the leg opposite angle $R$ is 52 , and the length of the hypotenuse is 53 . Therefore, the value of $\\sin R$ is $\\frac{52}{53}$. Note that $52 / 53$ or .9811 are examples of ways to enter a correct answer. Question Difficulty: Hard",
     "pdfFile": "a67b9f88.pdf",
-    "questionImage": "",
+    "questionImage": "SAT-Question-Bank/Images/a67b9f88.png",
     "validationStatus": "",
     "reviewed": false,
     "gotWrong": false,
-    "needsContentReview": true,
-    "contentIssues": [
-      "possible_missing_formula",
-      "possible_missing_formula",
-      "answer_stripped_from_rationale"
-    ]
+    "needsContentReview": false,
+    "contentIssues": []
   },
   {
     "source": "College Board",
