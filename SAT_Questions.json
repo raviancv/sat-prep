@@ -6962,10 +6962,10 @@
     "questionText": "A team hosting an event to raise money for new uniforms plans to sell at least 140 tickets before this event and at least 220 tickets during this event to raise a total of at least $\\$ 5,820$ from all tickets sold. The price of a ticket during this event is $\\$ 3$ less than the price of a ticket before this event. Which inequality represents this situation, where $x$ is the price, in dollars, of a ticket sold during this event?",
     "type": "mc",
     "choices": [
-      "$140(x+3)+220x \\leq 5{,}820$",
-      "$140(x+3)+220x \\geq 5{,}820$",
-      "$140(x-3)+220x \\leq 5{,}820$",
-      "$140(x-3)+220x \\geq 5{,}820$"
+      "$140(x+3)+220x \\le 5{,}820$",
+      "$140(x+3)+220x \\ge 5{,}820$",
+      "$140(x-3)+220x \\le 5{,}820$",
+      "$140(x-3)+220x \\ge 5{,}820$"
     ],
     "correctAnswer": "B",
     "rationale": "Choice B is correct. It's given that a team plans to sell at least 140 tickets before an event and at least 220 tickets during the event to raise a total of at least $\\$ 5,820$ from all tickets sold. It's also given that the price of a ticket during the event is $\\$ 3$ less than the price of a ticket before the event and that $x$ represents the price, in dollars, of a ticket sold during the event. It follows that $x+3$ represents the price, in dollars, of a ticket sold before the event. The expression $140(x+3)$ represents the planned revenue, in dollars, from the tickets sold before the event, and the expression $220 x$ represents the planned revenue, in dollars, from the tickets sold during the event. Thus, the expression $140(x+3)+220 x$ represents the planned revenue, in dollars, from all tickets sold. Since the team plans to raise a total of at least $\\$ 5,820$ from all tickets sold, the total revenue must be at least $\\$ 5,820$. Therefore, the inequality $140(x+3)+220 $x \\geq 5$,820$ represents this situation. Choice A is incorrect. This inequality represents a situation in which the team raises a total of at most $\\$ 5,820$ from all tickets sold. Choice C is incorrect. This inequality represents a situation in which the price of a ticket before the event is $\\$ 3$ less, rather than $\\$ 3$ more, than the price of a ticket during the event and the team raises a total of at most $\\$ 5,820$ from all tickets sold. Choice D is incorrect. This inequality represents a situation in which the price of a ticket before the event is $\\$ 3$ less, rather than $\\$ 3$ more, than the price of a ticket during the event.",
@@ -12181,7 +12181,7 @@
     "questionText": "Note: Figure not drawn to scale. The area of triangle $A B C$ above is at least 48 but no more than 60 . If $y$ is an integer, what is one possible value of $x$ ?",
     "type": "free",
     "choices": [],
-    "correctAnswer": "either",
+    "correctAnswer": "10/3, 15/4, 25/6, 3.333, 3.75, 4.166, 4.167",
     "rationale": "The correct answer is either $\\frac{10}{3}, \\frac{15}{4}$, or $\\frac{25}{6}$. The area of triangle $A B C$ can be expressed as $\\frac{1}{2}(5+7) y$ or $6 y$. It's given that the area of triangle ABC is at least 48 but no more than 60 . It follows that $48 \\leq 6 $y \\leq 6$0$. Dividing by 6 to isolate $y$ in this compound inequality yields $8 \\leq $y \\leq 1$0$. Since $y$ is an integer, $y=8,90$ or 10 . In the given figure, the two right triangles shown are similar because they have two pairs of congruent angles: their respective right angles and angle $A$. Therefore, the following proportion is true: $\\frac{x}{y}=\\frac{5}{12}$. Substituting 8 for $y$ in the proportion results in $\\frac{x}{8}=\\frac{5}{12}$. Cross multiplying and solving for $x$ yields $\\frac{10}{3}$. Substituting 9 for $y$ in the proportion results in $\\frac{x}{9}=\\frac{5}{12}$. Cross multiplying and solving for $x$ yields $\\frac{15}{4}$. Substituting 10 for $y$ in the proportion results in $\\frac{x}{10}=\\frac{5}{12}$. Cross multiplying and solving for $x$ yields $\\frac{25}{6}$. Note that $10 / 3,15 / 4,25 / 6,3.333,3.75,4.166$, and 4.167 are examples of ways to enter a correct answer.",
     "pdfFile": "eeb4143c.pdf",
     "questionImage": "SAT-Question-Bank/Images/eeb4143c.png",
